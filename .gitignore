@@ -1,0 +1,7 @@
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
+
+# 本地文件可能包含真实上游密钥，仅提交 config_example.py。
+src/config.py
