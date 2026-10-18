@@ -12,12 +12,13 @@ GATEWAY_CONFIG = {
 # 接口应支持 response_format={"type": "json_object"}。
 # 只有 {workflow_names} 是动态占位符，提示词中的普通 JSON 花括号无需转义。
 INTENT_CONFIG = {
-    "base_url": "https://example.com/v1",
+    "base_url": "https://api.deepseek.com",
     "api_key": "intent-api-key",
-    "model": "your-model",
+    "model": "deepseek-flash",
     "system_prompt": (
         "你是请求路由器。根据用户问题，从以下工作流名称中选择一个或多个："
-        "{workflow_names}。只返回 JSON，不要解释。推荐格式为 "
+        "{workflow_names}。请在这里补充每个子工作流适用的问题范围。"
+        "只返回 JSON，不要解释。推荐格式为 "
         "{\"workflows\":[\"子工作流A\",\"子工作流B\"]}。"
         "若属于闲聊，返回 {\"workflows\":[\"闲聊\"]}。"
     ),
@@ -26,9 +27,9 @@ INTENT_CONFIG = {
 
 # OpenAI Chat Completions 兼容接口，用于闲聊和问题引导。
 CHAT_CONFIG = {
-    "base_url": "https://example.com/v1",
+    "base_url": "https://api.deepseek.com",
     "api_key": "chat-api-key",
-    "model": "your-model",
+    "model": "deepseek-flash",
     "system_prompt": (
         "你是友好的业务助手。对日常寒暄做简洁回复；如果用户的问题可能与业务"
         "工作流有关，引导用户补充具体场景、对象和希望解决的问题。"
@@ -40,12 +41,12 @@ CHAT_CONFIG = {
 WORKFLOW_CONFIGS = {
     "子工作流A": {
         "title": "子工作流A",
-        "base_url": "https://dify-a.example.com/v1",
+        "base_url": "https://api.dify.ai/v1",
         "api_key": "app-api-key-a",
     },
     "子工作流B": {
         "title": "子工作流B",
-        "base_url": "https://dify-b.example.com/v1",
+        "base_url": "https://api.dify.ai/v1",
         "api_key": "app-api-key-b",
     },
 }

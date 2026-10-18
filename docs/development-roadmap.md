@@ -236,7 +236,105 @@
 - 串行多 Chatflow 行为与模拟测试一致。
 - 发现的版本差异被记录并纳入测试。
 
-## 13. 后续路线：并行调用、顺序回放
+## 13. 后续优化：ID、会话状态与审计持久化
+
+### 13.1 当前实现基线
+
+当前版本的四类公共 ID 都在每次请求开始时通过 UUID 生成，但保存周期不同：
+
+| ID | 当前保存位置 | 生命周期 | 容器重启影响 |
+|---|---|---|---|
+| `conversation_id` | `MemoryState.conversations` 的字典 key | 进程存活期间持续保留 | 公共会话到各子 Chatflow 会话的映射全部丢失 |
+| `message_id` | 当前请求的局部 `ids` 字典 | 当前 SSE 请求 | 请求结束后无可查询记录 |
+| `task_id` | `MemoryState.tasks` 的字典 key | 仅任务运行期间，结束后主动删除 | 活动任务无法再停止，也无法判断中断状态 |
+| `workflow_run_id` | 当前请求的局部 `ids` 字典 | 当前 SSE 请求 | 请求结束后无可查询记录 |
+
+子 Chatflow ID 的现状：
+
+- 子 `conversation_id` 会保存到 `MemoryState.conversations`，用于多轮对话。
+- 子 `task_id` 仅在当前调用期间挂到活动任务，用于转发停止请求，完成后清空。
+- 子 `message_id` 和子 `workflow_run_id` 当前没有落库，也没有形成完整的公共/子 ID 关联记录。
+- Python 标准日志仅输出到 stdout；若容器日志没有外部采集或持久化，重建容器后无法作为可靠审计记录。
+
+因此当前内存实现只适合单进程开发验证，不支持多 worker、多副本、滚动升级、崩溃恢复或历史查询。
+
+### 13.2 Dify 的实现参考
+
+Dify 将执行历史主要保存在关系数据库中，默认自托管配置使用 PostgreSQL，也支持
+其他数据库配置；SQLAlchemy 是其持久化模型层。主要记录包括：
+
+- `conversations`：应用、模型、名称/摘要、输入、来源、最终用户或账号、对话轮数、状态和时间。
+- `messages`：`conversation_id`、问题、回答、模型、Token、费用、延迟、状态、错误、元数据和关联的 `workflow_run_id`。
+- `workflow_runs`：工作流版本和图快照、输入/输出、状态、错误、耗时、Token、步骤数、发起人和起止时间。
+- `workflow_node_executions`：逐节点的输入、过程数据、输出、状态、错误、耗时以及 Token/费用等执行元数据。
+- `workflow_app_logs`：一张较薄的索引表，用于把运行关联到 workspace、app、workflow、调用来源和发起人。
+- `dataset_retriever_resources`：按 `message_id` 保存知识检索引用。
+- 过大的节点输入/输出可通过 `workflow_node_execution_offloads` 转移到文件/对象存储。
+
+Dify 的 `task_id` 与上述持久化运行记录职责不同：它主要用于正在运行任务的停止与归属校验。
+当前源码通过 Redis 保存任务归属和停止标记，并通过 GraphEngine 的 Redis 命令通道停止工作流；
+真正用于历史查询和审计关联的是 `message_id`、`conversation_id` 和 `workflow_run_id`。
+
+Dify 还通过 Celery 的 `workflow_storage` 队列异步保存或更新工作流运行，失败时重试，
+以减少主响应链路的数据库写入压力。需要注意，Dify 的 Logs 更接近“应用运行历史和排障记录”，
+不是天然不可篡改的合规审计账本。
+
+参考：
+
+- [Dify 日志说明](https://github.com/langgenius/dify-docs/blob/main/en/cloud/use-dify/monitor/logs.mdx)
+- [Conversation 与 Message 数据模型](https://github.com/langgenius/dify/blob/main/api/models/model.py)
+- [WorkflowRun、节点执行与 WorkflowAppLog 数据模型](https://github.com/langgenius/dify/blob/main/api/models/workflow.py)
+- [工作流运行异步持久化任务](https://github.com/langgenius/dify/blob/main/api/tasks/workflow_execution_tasks.py)
+- [运行任务停止与 Redis 控制](https://github.com/langgenius/dify/blob/main/api/services/app_task_service.py)
+
+### 13.3 网关目标存储架构
+
+生产版本建议采用“PostgreSQL 保存事实，Redis 保存短期运行状态，stdout/OTel 保存运维遥测”的分层方案：
+
+1. PostgreSQL 作为唯一持久事实源，至少包含：
+   - `gateway_conversations`：公共会话、用户、状态和时间。
+   - `gateway_conversation_routes`：公共会话与各工作流子 `conversation_id` 的映射。
+   - `gateway_messages`：公共 `message_id`、问题/最终回答、路由结果、用量和完成状态。
+   - `gateway_runs`：公共 `workflow_run_id`、公共 `task_id`、状态、耗时和错误摘要。
+   - `gateway_child_runs`：工作流名称，以及全部公共/子 conversation、message、task、run ID，HTTP 状态、首字/总耗时、用量、引用数量和错误。
+   - `gateway_audit_events`：只追加的关键事件，例如请求接收、路由完成、子调用开始/结束、停止、失败和恢复。
+2. Redis 仅保存活动任务、取消标记、当前子任务、分布式锁和带 TTL 的任务租约，不作为历史审计来源。
+3. 应用日志改为 JSON 结构化输出，由 Docker 日志驱动或 Loki/ELK 等外部系统采集；使用公共 ID 作为关联键。
+4. 可选接入 OpenTelemetry，把网关请求、意图识别和每个子 Chatflow 调用组织为同一条 trace。
+5. 不逐条持久化所有 SSE 文本 chunk；默认保存最终拼接结果和生命周期事件，只有排障模式才短期保存原始事件。
+
+SQLite 只适合单实例本地验证。考虑后续 Docker Compose、多 worker 和并行调用，正式方案直接采用 PostgreSQL；
+数据库迁移使用 Alembic，避免依赖启动时自动建表。
+
+### 13.4 安全与保留策略
+
+- 永不保存 API Key、Authorization 头或完整配置快照。
+- 问题、回答、节点输入/输出可能包含敏感信息，需要支持“全文、脱敏、仅哈希、不保存”四档策略。
+- IP、User-Agent 等访问上下文按实际审计需求决定是否保存；IP 建议支持掩码或哈希。
+- 错误详情区分对外安全文案与内部诊断信息，内部堆栈不得回传调用方。
+- 为会话、消息、运行和审计事件分别配置保留天数，定时分批清理并记录清理审计。
+- 数据库需要备份、恢复演练、访问权限隔离；若有合规要求，再增加归档、签名或 WORM 存储。
+
+### 13.5 实施顺序
+
+1. **P0：关系模型与 ID 全链路**——先落库公共会话/消息/运行和子运行映射；补齐当前遗漏的子 `message_id`、子 `workflow_run_id`。
+2. **P0：可靠生命周期写入**——请求开始先创建 `running` 记录，结束更新为 `succeeded`、`partial_succeeded`、`failed` 或 `stopped`；启动时将超时的 `running` 标记为 `interrupted`。
+3. **P1：Redis 活动任务协调**——支持多 worker 下的停止请求、任务租约和并发控制；容器重启后明确返回“任务已中断”，而不是误报不存在。
+4. **P1：结构化审计事件**——形成可按公共 ID、用户、工作流、状态和时间检索的事件链，并对敏感字段执行统一脱敏。
+5. **P1：查询与运维接口**——先提供内部管理查询，不立即复制 Dify 全部会话管理 API。
+6. **P2：异步写入与可观测性**——在吞吐量需要时引入持久队列/任务 worker，并接入 OTel、指标和日志平台。
+7. **P2：保留与归档**——实现分批清理、长期归档、备份恢复和容量告警。
+
+验收条件：
+
+- 重启容器后，多轮请求仍能找到每个子 Chatflow 的 `conversation_id`。
+- 任一公共 ID 都能查询到对应的全部子 ID、路由顺序、状态和时间。
+- 多 worker 环境中停止请求能够定位并停止当前子任务。
+- 进程异常后不存在永久停留在 `running` 的记录。
+- 审计查询不依赖容器本地日志文件，且日志和数据库中均无密钥。
+- 保留策略可配置、可测试、可观察，并能从备份恢复关键关联数据。
+
+## 14. 后续路线：并行调用、顺序回放
 
 第一阶段稳定后再实施。
 
@@ -265,7 +363,7 @@
 - 缓冲达到上限时行为明确且不会耗尽内存。
 - 停止请求能够取消全部并行子任务。
 
-## 14. 第一阶段完成定义
+## 15. 第一阶段完成定义
 
 同时满足以下条件时，串行 MVP 才算完成：
 
