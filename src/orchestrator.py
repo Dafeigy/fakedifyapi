@@ -2,9 +2,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -18,6 +19,29 @@ from .state import ActiveTask, state
 
 logger = logging.getLogger(__name__)
 _END = object()
+_TOKEN_PATTERN = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|"
+    r"[\w]+(?:['’][\w]+)*|\s+|[^\w\s]",
+    re.UNICODE,
+)
+_OUTPUT_QUEUE_MAXSIZE = 512
+
+
+def _text_units(text: str) -> Iterator[str]:
+    """Split text into lossless, model-independent pacing units.
+
+    CJK characters and punctuation count as one unit; whitespace runs and
+    alphanumeric words count as one. This is a readable-output proxy, not a
+    tokenizer for any particular upstream model.
+    """
+    position = 0
+    for match in _TOKEN_PATTERN.finditer(text):
+        if match.start() > position:
+            yield text[position : match.start()]
+        yield match.group()
+        position = match.end()
+    if position < len(text):
+        yield text[position:]
 
 
 def _public_ids(conversation_id: str) -> dict[str, str]:
@@ -108,7 +132,7 @@ def _clean_resources(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
 async def _produce(
     request: ChatMessageRequest,
     ids: dict[str, str],
-    queue: asyncio.Queue[bytes | object],
+    queue: asyncio.Queue[tuple[bytes, bool] | object],
     client: httpx.AsyncClient,
 ) -> None:
     started = time.monotonic()
@@ -119,8 +143,16 @@ async def _produce(
     async with state.lock:
         state.tasks[ids["task_id"]] = task
 
-    async def emit(payload: dict[str, Any]) -> None:
-        await queue.put(encode_data(payload))
+    async def emit(payload: dict[str, Any], *, paced: bool = False) -> None:
+        if (
+            paced
+            and GATEWAY_CONFIG.get("output_pacing_enabled", True)
+            and isinstance(payload.get("answer"), str)
+        ):
+            for unit in _text_units(payload["answer"]):
+                await queue.put((encode_data(_message(ids, unit)), True))
+            return
+        await queue.put((encode_data(payload), False))
 
     async def finish(status: str) -> None:
         nonlocal finalized
@@ -169,7 +201,7 @@ async def _produce(
                 async for text in llm.stream_chat(request.query, CHAT_CONFIG):
                     if task.cancelled.is_set():
                         break
-                    await emit(_message(ids, text))
+                    await emit(_message(ids, text), paced=True)
             except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning("casual_chat_failed task_id=%s error=%s", ids["task_id"], exc)
                 await emit(_message(ids, "闲聊服务暂时不可用，请稍后重试。"))
@@ -209,7 +241,7 @@ async def _produce(
                             answer = payload.get("answer")
                             if isinstance(answer, str) and answer:
                                 had_text = True
-                                await emit(_message(ids, answer))
+                                await emit(_message(ids, answer), paced=True)
                         elif child_event.event == "message_end":
                             metadata = payload.get("metadata") or {}
                             found = metadata.get("retriever_resources") or []
@@ -224,10 +256,11 @@ async def _produce(
                         _collect_usage(usage, child_usage)
                 except (httpx.HTTPError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
                     logger.warning(
-                        "child_failed task_id=%s workflow=%s partial=%s error=%s",
+                        "child_failed task_id=%s workflow=%s partial=%s error_type=%s error=%r",
                         ids["task_id"],
                         workflow,
                         had_text,
+                        type(exc).__name__,
                         exc,
                     )
                     failure = (
@@ -252,12 +285,16 @@ async def _produce(
     finally:
         async with state.lock:
             state.tasks.pop(ids["task_id"], None)
-        await queue.put(_END)
+        current = asyncio.current_task()
+        if current is None or not current.cancelling():
+            await queue.put(_END)
 
 
 async def stream_response(request: ChatMessageRequest) -> AsyncIterator[bytes]:
     ids = _public_ids(request.conversation_id)
-    queue: asyncio.Queue[bytes | object] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[bytes, bool] | object] = asyncio.Queue(
+        maxsize=max(1, int(GATEWAY_CONFIG.get("output_buffer_units", _OUTPUT_QUEUE_MAXSIZE)))
+    )
     timeout = httpx.Timeout(
         connect=float(GATEWAY_CONFIG.get("connect_timeout_seconds", 10)),
         read=float(GATEWAY_CONFIG.get("read_timeout_seconds", 300)),
@@ -268,7 +305,18 @@ async def stream_response(request: ChatMessageRequest) -> AsyncIterator[bytes]:
         producer = asyncio.create_task(_produce(request, ids, queue, client))
         try:
             yield encode_ping()
-            heartbeat = float(GATEWAY_CONFIG.get("heartbeat_interval_seconds", 15))
+            heartbeat = max(
+                0.1, float(GATEWAY_CONFIG.get("heartbeat_interval_seconds", 15))
+            )
+            pacing_enabled = bool(GATEWAY_CONFIG.get("output_pacing_enabled", True))
+            pacing_mode = str(GATEWAY_CONFIG.get("output_pacing_mode", "adaptive"))
+            base_rate = max(0.1, float(GATEWAY_CONFIG.get("output_tokens_per_second", 7)))
+            max_rate = max(base_rate, float(GATEWAY_CONFIG.get("output_max_tokens_per_second", 28)))
+            backlog_threshold = max(1, int(GATEWAY_CONFIG.get("output_backlog_threshold", 35)))
+            next_token_at = time.monotonic()
+            started = next_token_at
+            sent_units = 0
+            max_backlog = 0
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=heartbeat)
@@ -277,7 +325,32 @@ async def stream_response(request: ChatMessageRequest) -> AsyncIterator[bytes]:
                     continue
                 if item is _END:
                     break
-                yield item  # type: ignore[misc]
+                frame, paced = item
+                if paced and pacing_enabled:
+                    backlog = queue.qsize()
+                    max_backlog = max(max_backlog, backlog)
+                    rate = base_rate
+                    if pacing_mode == "adaptive" and backlog > backlog_threshold:
+                        rate = min(max_rate, base_rate * (1 + backlog / backlog_threshold))
+                    delay = next_token_at - time.monotonic()
+                    while delay > 0:
+                        if delay >= heartbeat:
+                            await asyncio.sleep(heartbeat)
+                            yield encode_ping()
+                        else:
+                            await asyncio.sleep(delay)
+                        delay = next_token_at - time.monotonic()
+                    now = time.monotonic()
+                    next_token_at = max(next_token_at, now) + 1 / rate
+                    sent_units += 1
+                yield frame
+            if sent_units:
+                elapsed = max(time.monotonic() - started, 0.001)
+                logger.info(
+                    "stream_pacing task_id=%s mode=%s units=%d avg_units_per_second=%.2f max_backlog=%d",
+                    ids["task_id"], pacing_mode if pacing_enabled else "disabled",
+                    sent_units, sent_units / elapsed, max_backlog,
+                )
         finally:
             if not producer.done():
                 producer.cancel()

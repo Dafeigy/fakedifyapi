@@ -6,6 +6,14 @@ GATEWAY_CONFIG = {
     "heartbeat_interval_seconds": 15,
     "connect_timeout_seconds": 10,
     "read_timeout_seconds": 300,
+    # Stream text at a readable pace. Units use a model-independent heuristic;
+    # configure a model tokenizer separately if exact token counts are needed.
+    "output_pacing_enabled": True,
+    "output_pacing_mode": "adaptive",  # "strict" or "adaptive"
+    "output_tokens_per_second": 60,
+    "output_max_tokens_per_second": 120,
+    "output_backlog_threshold": 35,
+    "output_buffer_units": 512,
 }
 
 # OpenAI Chat Completions 兼容接口，用于意图识别。

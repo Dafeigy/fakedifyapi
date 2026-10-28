@@ -9,3 +9,11 @@ services:
     volumes:
       - ./src:/app/src
     restart: unless-stopped
+    networks:
+      - default
+      - dify
+
+networks:
+  dify:
+    external: true
+    name: dify_v1111_default

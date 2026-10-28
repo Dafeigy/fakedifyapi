@@ -14,7 +14,10 @@
    ```bash
    docker compose up --build
    ```
-
+   或者直接干：
+   ```bash
+   python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000 
+   ```
 3. 调用接口：
 
    ```bash
@@ -36,8 +39,14 @@
 - `["闲聊"]` 走单独的兼容接口和指定提示词。
 - 多工作流严格串行调用；单个工作流失败不影响后续工作流。
 - 公共 SSE 自行发送心跳，只发送一组公共 ID 和一个最终 `message_end`。
+- 流式回答默认以 7 个文本单位/秒起步平滑输出；默认自适应模式会在积压时加速，严格模式固定速率。单位采用与模型无关的分词近似，不代表上游模型的精确 token 数。
 
 当前会话与任务映射保存在单进程内存中；部署多个 worker 前需要换成共享存储。
+
+流式节奏通过 `GATEWAY_CONFIG` 配置：`output_pacing_enabled` 控制开关，
+`output_pacing_mode` 可设为 `adaptive` 或 `strict`，`output_tokens_per_second`
+默认是 7。`output_max_tokens_per_second`、`output_backlog_threshold` 和
+`output_buffer_units` 分别控制自适应上限、积压阈值和有界缓冲。
 
 ## 设计文档
 
