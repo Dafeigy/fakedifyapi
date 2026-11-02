@@ -157,11 +157,13 @@ FastAPI 接口层
 - 判断为闲聊时返回 `["闲聊"]`，使用独立提示词流式回复并引导提问。
 - 请求、协议或解析失败时内部统一返回 `["错误"]`，公共流输出友好错误文本。
 
-意图识别接口不保留 Dify Chatflow 会话，仅使用当前用户问题进行判断。
+意图识别接口本身不保存会话。网关会把同一用户、同一公共会话最近三轮已完成请求中的 query
+和成功子工作流回答作为上下文传入意图识别接口，以处理“它”“上面那个”等省略式追问；
+首轮请求没有历史上下文时只传当前 query。
 
 ### 6.3 Dify Chatflow 客户端
 
-计划使用异步 HTTP 客户端连接业务 Chatflow，并以 SSE 帧为边界解析响应。
+使用异步 HTTP 客户端连接业务 Chatflow，并以 SSE 帧为边界解析响应。
 
 职责：
 
@@ -179,11 +181,11 @@ FastAPI 接口层
 
 1. 检查公共任务是否已取消。
 2. 输出 `\n\n### {title}\n\n`。首个标题可不包含前导空行。
-3. 查找该公共会话对应的子 `conversation_id`。
+3. 按用户和公共会话查找该工作流对应的子 `conversation_id`。
 4. 调用子 Chatflow。
 5. 将子 `message.answer` 转换为使用公共 ID 的 `message` 事件。
 6. 截留子 `message_end`，保存引用和用量。
-7. 等待子 `workflow_finished` 或流结束。
+7. 等待子 `workflow_finished`，据其状态判定子调用是否成功。
 8. 保存该子 Chatflow 返回的 `conversation_id`。
 9. 继续下一个路由。
 
@@ -197,35 +199,46 @@ FastAPI 接口层
 
 需要保存两类映射。
 
-会话映射：
+会话映射按用户隔离：
 
 ```text
-public_conversation_id
+user + public_conversation_id
   ├── router -> router_conversation_id（如启用）
   ├── enterprise_policy -> child_conversation_id_a
   └── hr_assistant -> child_conversation_id_b
 ```
+
+请求历史按请求保存请求时间、query、路由结果、子工作流 conversation ID、子流程回答和耗时。
+每次请求的 `success` 只要至少一个子工作流正常结束即为 `true`。意图识别会读取最近三轮已完成请求；
+中断请求不作为上下文。
 
 运行任务映射：
 
 ```text
 public_task_id
   ├── status
-  ├── current_route
-  ├── current_child_task_id
-  └── cancelled
+  ├── current_route / current_child_task_id（SQLite）
+  └── stop_requested（SQLite，由实际处理请求的 worker 轮询）
 ```
 
-单进程开发阶段可以使用内存实现；生产环境若运行多个实例，应使用共享存储。具体实现将在开发规范和部署规范确定后决定。
+子会话映射和请求记录保存在本地 `data/gateway_state.sqlite3`，Docker Compose 将 `./data` 挂载为持久目录。
+SQLite 使用事务协调同一主机上多个 FastAPI worker 的并发写入。每个用户会话有数据库租约锁，
+同一会话的请求按入队顺序执行，不同会话可以并行。worker 定期续租；崩溃后租约到期，后续请求
+会把遗留运行标记为中断并接管。停止接口可由任意 worker 接收，再通过 SQLite 中的活动任务信息
+向上游转发，并由实际处理请求的 worker 轮询停止标记。
+
+SQLite 文件适用于同一主机上的多个 worker。多个主机或容器若不共享同一可靠本地文件系统，
+应改用共享数据库服务。旧版 `data/gateway_state.json` 会在首次启动时尝试导入；导入完成标记
+保存在 SQLite 中，之后不会重复导入。
 
 ## 7. ID 策略
 
 ### 7.1 `conversation_id`
 
 - 第一次公共调用未传或传空值时，由网关创建公共 `conversation_id`。
-- 网关为每个公共会话保存各子 Chatflow 的 `conversation_id`。
+- 网关按用户和公共会话保存各子 Chatflow 的 `conversation_id`。
 - 后续命中已有子 Chatflow 时，使用已保存的子会话 ID。
-- 首次命中某个子 Chatflow 时传空值，并保存其返回的子会话 ID。
+- 首次命中某个子 Chatflow 时省略 `conversation_id`，并保存其返回的子会话 ID。
 - 公共事件永远只暴露公共 `conversation_id`。
 
 ### 7.2 `message_id`
@@ -382,18 +395,18 @@ POST /v1/chat-messages/{public_task_id}/stop
 
 停止流程：
 
-1. 验证请求中的 `user` 与原请求一致。
-2. 将公共任务标记为取消。
-3. 如果当前子 Chatflow 已产生 `task_id`，调用其停止接口。
-4. 关闭或取消当前上游流。
-5. 不再启动剩余子 Chatflow。
-6. 以目标 Dify 版本允许的方式结束公共流。
+1. 在 SQLite 中验证请求中的 `user` 与原请求一致，并设置停止标记。
+2. 如果当前子 Chatflow 已产生 `task_id`，由接收停止请求的 worker 调用其停止接口。
+3. 实际处理请求的 worker 轮询停止标记，结束当前上游流并停止后续路由。
+4. 以目标 Dify 版本允许的方式结束公共流。
 
 停止后的最终事件细节需要在获得真实 Dify 样例后固定。
 
 ## 14. 配置和安全
 
-配置集中在 `src/config.py`，示例结构见 `src/config_example.py`。业务路由使用
+配置集中在 `src/config.py`，示例结构见 `src/config_example.py`。状态数据库路径由
+`GATEWAY_CONFIG["state_db"]` 配置，默认是 `data/gateway_state.sqlite3`。数据库含原始 query
+和子工作流回答，应限制文件和备份的访问权限。业务路由使用
 字典保存，key 必须与意图识别返回的名称一致：
 
 ```python
@@ -505,7 +518,7 @@ public request
 - Python 版本和依赖管理工具。
 - 项目目录结构。
 - 配置加载方式。
-- 状态存储选型。
+- 多主机部署时的共享数据库选型。
 - 日志和追踪标准。
 - 测试框架及覆盖率要求。
 - 格式化、类型检查和 lint 工具。

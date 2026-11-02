@@ -6,6 +6,9 @@ __pycache__/
 # 本地文件可能包含真实上游密钥，仅提交 config_example.py。
 src/config.py
 
+# Local conversation history and child conversation ID mappings.
+/data/
+
 # 归档文件不入库
 *.tar
 *.tar.gz

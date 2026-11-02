@@ -240,23 +240,25 @@
 
 ### 13.1 当前实现基线
 
-当前版本的四类公共 ID 都在每次请求开始时通过 UUID 生成，但保存周期不同：
+当前版本的公共 ID 都在每次请求开始时通过 UUID 生成，但保存周期不同：
 
 | ID | 当前保存位置 | 生命周期 | 容器重启影响 |
 |---|---|---|---|
-| `conversation_id` | `MemoryState.conversations` 的字典 key | 进程存活期间持续保留 | 公共会话到各子 Chatflow 会话的映射全部丢失 |
-| `message_id` | 当前请求的局部 `ids` 字典 | 当前 SSE 请求 | 请求结束后无可查询记录 |
-| `task_id` | `MemoryState.tasks` 的字典 key | 仅任务运行期间，结束后主动删除 | 活动任务无法再停止，也无法判断中断状态 |
+| `conversation_id` | `data/gateway_state.sqlite3` 的 `conversations` 和 `requests` | 本地 SQLite 永久保留 | 由 Docker `./data` 挂载恢复 |
+| `message_id` | SQLite `requests.request_id`（与公共 `message_id` 相同） | 请求记录永久保留 | 由 Docker `./data` 挂载恢复 |
+| `task_id` | SQLite `active_tasks` 加本地取消信号 | 仅任务运行期间，结束后主动删除 | 运行中可从其他 worker 转发停止；崩溃任务由会话租约过期回收 |
 | `workflow_run_id` | 当前请求的局部 `ids` 字典 | 当前 SSE 请求 | 请求结束后无可查询记录 |
 
 子 Chatflow ID 的现状：
 
-- 子 `conversation_id` 会保存到 `MemoryState.conversations`，用于多轮对话。
+- 子 `conversation_id` 会保存到 `data/gateway_state.sqlite3`，用于多轮对话和重启恢复。
 - 子 `task_id` 仅在当前调用期间挂到活动任务，用于转发停止请求，完成后清空。
-- 子 `message_id` 和子 `workflow_run_id` 当前没有落库，也没有形成完整的公共/子 ID 关联记录。
+- 子 `message_id` 和子 `workflow_run_id` 当前没有保存；请求记录关联公共 query、路由和各子工作流会话 ID。
 - Python 标准日志仅输出到 stdout；若容器日志没有外部采集或持久化，重建容器后无法作为可靠审计记录。
 
-因此当前内存实现只适合单进程开发验证，不支持多 worker、多副本、滚动升级、崩溃恢复或历史查询。
+当前 SQLite 实现支持同一主机上的多个 FastAPI worker、请求历史留存和容器重启恢复；
+活动任务和同会话排队也通过 SQLite 在 worker 间协调。跨主机部署、保留策略、结构化审计查询
+和完整子 message/run ID 关联仍需后续扩展。本地请求记录目前没有配套的历史查询 API。
 
 ### 13.2 Dify 的实现参考
 
@@ -303,8 +305,9 @@ Dify 还通过 Celery 的 `workflow_storage` 队列异步保存或更新工作�
 4. 可选接入 OpenTelemetry，把网关请求、意图识别和每个子 Chatflow 调用组织为同一条 trace。
 5. 不逐条持久化所有 SSE 文本 chunk；默认保存最终拼接结果和生命周期事件，只有排障模式才短期保存原始事件。
 
-SQLite 只适合单实例本地验证。考虑后续 Docker Compose、多 worker 和并行调用，正式方案直接采用 PostgreSQL；
-数据库迁移使用 Alembic，避免依赖启动时自动建表。
+当前 SQLite 已覆盖同一主机 Docker Compose 和多 FastAPI worker 的运行方式。若扩展到多主机、
+更高写入吞吐量或外部审计查询，可迁移到 PostgreSQL；届时用 Alembic 管理 schema 迁移，
+避免依赖启动时自动建表。Redis 可在需要跨主机任务协调时再评估，不是当前单主机多 worker 的前置条件。
 
 ### 13.4 安全与保留策略
 
@@ -317,9 +320,9 @@ SQLite 只适合单实例本地验证。考虑后续 Docker Compose、多 worker
 
 ### 13.5 实施顺序
 
-1. **P0：关系模型与 ID 全链路**——先落库公共会话/消息/运行和子运行映射；补齐当前遗漏的子 `message_id`、子 `workflow_run_id`。
-2. **P0：可靠生命周期写入**——请求开始先创建 `running` 记录，结束更新为 `succeeded`、`partial_succeeded`、`failed` 或 `stopped`；启动时将超时的 `running` 标记为 `interrupted`。
-3. **P1：Redis 活动任务协调**——支持多 worker 下的停止请求、任务租约和并发控制；容器重启后明确返回“任务已中断”，而不是误报不存在。
+1. **P0：关系模型与 ID 全链路**——当前已保存公共 query、路由和子 `conversation_id`；补齐当前遗漏的子 `message_id`、子 `workflow_run_id`。
+2. **P0：可靠生命周期写入**——当前记录请求排队、运行、完成和中断状态；继续完善超时恢复和错误状态细分。
+3. **P1：跨主机任务协调**——若部署扩展到多主机，再评估 Redis 或数据库服务提供的分布式任务协调和租约。
 4. **P1：结构化审计事件**——形成可按公共 ID、用户、工作流、状态和时间检索的事件链，并对敏感字段执行统一脱敏。
 5. **P1：查询与运维接口**——先提供内部管理查询，不立即复制 Dify 全部会话管理 API。
 6. **P2：异步写入与可观测性**——在吞吐量需要时引入持久队列/任务 worker，并接入 OTel、指标和日志平台。
@@ -329,7 +332,7 @@ SQLite 只适合单实例本地验证。考虑后续 Docker Compose、多 worker
 
 - 重启容器后，多轮请求仍能找到每个子 Chatflow 的 `conversation_id`。
 - 任一公共 ID 都能查询到对应的全部子 ID、路由顺序、状态和时间。
-- 多 worker 环境中停止请求能够定位并停止当前子任务。
+- 同一主机多 worker 环境中停止请求能够定位并停止当前子任务。
 - 进程异常后不存在永久停留在 `running` 的记录。
 - 审计查询不依赖容器本地日志文件，且日志和数据库中均无密钥。
 - 保留策略可配置、可测试、可观察，并能从备份恢复关键关联数据。

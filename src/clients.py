@@ -38,16 +38,34 @@ class OpenAICompatibleClient:
         query: str,
         config: dict[str, Any],
         workflow_names: list[str],
+        conversation_context: list[dict[str, Any]] | None = None,
     ) -> list[str]:
         prompt = str(config["system_prompt"]).replace(
             "{workflow_names}", "、".join(workflow_names)
         )
+        messages: list[dict[str, str]] = [{"role": "system", "content": prompt}]
+        if conversation_context:
+            messages[0]["content"] += (
+                "若存在最近对话记录，请结合其中已完成的问答理解当前问题中的指代和省略信息；"
+                "只为当前问题选择需要调用的工作流。"
+            )
+            for turn in conversation_context:
+                prior_query = turn.get("query")
+                if isinstance(prior_query, str) and prior_query:
+                    messages.append({"role": "user", "content": prior_query})
+                answers = turn.get("answers") or []
+                if answers:
+                    answer_text = "\n\n".join(
+                        f"[{item.get('workflow', '工作流')}]\n{item.get('answer', '')}"
+                        for item in answers
+                        if isinstance(item, dict) and item.get("answer")
+                    )
+                    if answer_text:
+                        messages.append({"role": "assistant", "content": answer_text})
+        messages.append({"role": "user", "content": query})
         payload = {
             "model": config["model"],
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": query},
-            ],
+            "messages": messages,
             "temperature": config.get("temperature", 0),
             "response_format": {"type": "json_object"},
         }
@@ -125,10 +143,11 @@ class DifyClient:
             "inputs": request.inputs,
             "query": request.query,
             "response_mode": "streaming",
-            "conversation_id": conversation_id,
             "user": request.user,
             "files": request.files,
         }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
         async with self.client.stream(
             "POST",
             _endpoint(config["base_url"], "chat-messages"),

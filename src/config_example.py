@@ -3,6 +3,9 @@
 # 网关自身配置。留空表示开发阶段不校验调用方 Authorization。
 GATEWAY_CONFIG = {
     "api_key": "change-me",
+    "state_db": "data/gateway_state.sqlite3",
+    # One-time import source for state created by earlier JSON-backed versions.
+    "state_file": "data/gateway_state.json",
     "heartbeat_interval_seconds": 15,
     "connect_timeout_seconds": 10,
     "read_timeout_seconds": 300,

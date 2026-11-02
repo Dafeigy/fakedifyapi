@@ -29,6 +29,8 @@
 
 开发容器通过 `uvicorn --reload --host 0.0.0.0 --port 8000` 启动，且
 `./src` 挂载到容器 `/app/src`，修改代码后会自动重载。
+部署多个 FastAPI worker 时使用 `uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 4`；
+多 worker 模式不要启用 `--reload`。所有 worker 需访问同一主机上的 `./data` SQLite 文件。
 
 ## 当前实现
 
@@ -38,10 +40,16 @@
 - 意图结果支持 JSON 裸列表及 `{"workflows": [...]}`，异常统一转为 `["错误"]`。
 - `["闲聊"]` 走单独的兼容接口和指定提示词。
 - 多工作流严格串行调用；单个工作流失败不影响后续工作流。
+- 意图识别使用当前 query 和同一用户会话最近三轮已完成的 query/成功子工作流回答。
 - 公共 SSE 自行发送心跳，只发送一组公共 ID 和一个最终 `message_end`。
 - 流式回答默认以 7 个文本单位/秒起步平滑输出；默认自适应模式会在积压时加速，严格模式固定速率。单位采用与模型无关的分词近似，不代表上游模型的精确 token 数。
 
-当前会话与任务映射保存在单进程内存中；部署多个 worker 前需要换成共享存储。
+公共会话到子工作流会话的映射，以及每次请求的路由/回答记录保存在
+`data/gateway_state.sqlite3`；Docker Compose 将 `./data` 挂载到容器，容器重启或重建后可恢复。
+SQLite 事务支持多个 FastAPI worker 并发读写，并按用户和公共会话串行执行同一会话的轮次。
+记录永久保留并包含原始 query 和成功子工作流回答。首次启动时会尝试将旧的
+`data/gateway_state.json` 导入 SQLite。数据库损坏或无法读取时，服务会报错退出，不会以空状态覆盖旧数据。
+该本地 SQLite 文件用于同一主机的多个 worker；多主机部署需要共享数据库服务。
 
 流式节奏通过 `GATEWAY_CONFIG` 配置：`output_pacing_enabled` 控制开关，
 `output_pacing_mode` 可设为 `adaptive` 或 `strict`，`output_tokens_per_second`
@@ -60,7 +68,7 @@
 - 已确认失败策略：单个子 Chatflow 失败时输出简短错误提示，其余子 Chatflow 继续执行，公共调用正常结束。
 - 已确认引用策略：仅展示引用；按子 Chatflow 执行顺序汇总，并在公共 `message_end` 中一次性返回。
 - 暂无可用于联调的真实 Dify Chatflow；开发期间使用模拟上游和录制的 SSE 样例验证协议行为。
-- 当前只实现串行流式版本，多进程共享状态与并行调用留待后续版本。
+- 当前只实现串行流式版本；同主机多 worker 的共享状态和同会话排队已实现，并行调用留待后续版本。
 
 ## 文档索引
 

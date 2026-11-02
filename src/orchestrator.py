@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -129,6 +130,37 @@ def _clean_resources(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return cleaned
 
 
+async def _maintain_conversation_lock(
+    request: ChatMessageRequest,
+    public_id: str,
+    request_id: str,
+    task_id: str,
+    task: ActiveTask,
+    producer: asyncio.Task[Any],
+) -> None:
+    last_renewal = time.monotonic()
+    while True:
+        await asyncio.sleep(0.5)
+        try:
+            if await state.is_stop_requested(task_id):
+                task.cancelled.set()
+                return
+        except Exception:
+            logger.exception("stop_state_poll_failed task_id=%s", task_id)
+        try:
+            if time.monotonic() - last_renewal < 10:
+                continue
+            renewed = await state.renew_conversation_lock(request.user, public_id, request_id)
+        except Exception:
+            logger.exception("conversation_lock_renewal_failed request_id=%s", request_id)
+            continue
+        last_renewal = time.monotonic()
+        if not renewed:
+            task.cancelled.set()
+            producer.cancel()
+            return
+
+
 async def _produce(
     request: ChatMessageRequest,
     ids: dict[str, str],
@@ -136,13 +168,16 @@ async def _produce(
     client: httpx.AsyncClient,
 ) -> None:
     started = time.monotonic()
+    requested_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    request_id = ids["message_id"]
     task = ActiveTask(user=request.user)
     resources: list[dict[str, Any]] = []
     usage: dict[str, Any] = {}
     finalized = False
+    conversation_lock_acquired = False
+    lock_heartbeat: asyncio.Task[None] | None = None
     async with state.lock:
         state.tasks[ids["task_id"]] = task
-
     async def emit(payload: dict[str, Any], *, paced: bool = False) -> None:
         if (
             paced
@@ -179,6 +214,33 @@ async def _produce(
         finalized = True
 
     try:
+        await state.register_task(ids["task_id"], request.user, request_id)
+        await state.begin_request(
+            request_id=request_id,
+            public_id=ids["conversation_id"],
+            user=request.user,
+            query=request.query,
+            requested_at=requested_at,
+        )
+        conversation_lock_acquired = await state.acquire_conversation_lock(
+            request.user,
+            ids["conversation_id"],
+            request_id,
+            ids["task_id"],
+        )
+        if conversation_lock_acquired:
+            producer = asyncio.current_task()
+            if producer is not None:
+                lock_heartbeat = asyncio.create_task(
+                    _maintain_conversation_lock(
+                        request,
+                        ids["conversation_id"],
+                        request_id,
+                        ids["task_id"],
+                        task,
+                        producer,
+                    )
+                )
         await emit(
             {
                 **_base_event("workflow_started", ids),
@@ -188,13 +250,22 @@ async def _produce(
         )
 
         llm = OpenAICompatibleClient(client)
+        conversation_context = await state.get_recent_context(
+            request.user, ids["conversation_id"], 3
+        )
         raw_routes = await llm.classify(
-            request.query, INTENT_CONFIG, list(WORKFLOW_CONFIGS)
+            request.query,
+            INTENT_CONFIG,
+            list(WORKFLOW_CONFIGS),
+            conversation_context,
         )
         routes = _safe_routes(raw_routes)
+        await state.set_routes(request_id, routes)
         logger.info("intent_result task_id=%s routes=%s", ids["task_id"], routes)
 
-        if routes == ["错误"]:
+        if task.cancelled.is_set():
+            pass
+        elif routes == ["错误"]:
             await emit(_message(ids, "意图识别服务暂时不可用，请稍后重试。"))
         elif routes == ["闲聊"]:
             try:
@@ -218,9 +289,21 @@ async def _produce(
                 had_text = False
                 child_resources: list[dict[str, Any]] | None = None
                 child_usage: dict[str, Any] = {}
+                child_started = time.monotonic()
+                child_answer: list[str] = []
+                child_status = "failed"
+                saw_workflow_finished = False
                 child_conversation = await state.get_child_conversation(
-                    ids["conversation_id"], workflow
+                    request.user, ids["conversation_id"], workflow
                 )
+                if child_conversation:
+                    await state.save_child_conversation(
+                        request.user,
+                        ids["conversation_id"],
+                        workflow,
+                        child_conversation,
+                        request_id,
+                    )
                 try:
                     async for child_event in dify.stream_chatflow(
                         request, config, child_conversation
@@ -231,7 +314,11 @@ async def _produce(
                         returned_conversation = payload.get("conversation_id")
                         if isinstance(returned_conversation, str):
                             await state.save_child_conversation(
-                                ids["conversation_id"], workflow, returned_conversation
+                                request.user,
+                                ids["conversation_id"],
+                                workflow,
+                                returned_conversation,
+                                request_id,
                             )
                         child_task_id = payload.get("task_id")
                         if isinstance(child_task_id, str):
@@ -241,6 +328,7 @@ async def _produce(
                             answer = payload.get("answer")
                             if isinstance(answer, str) and answer:
                                 had_text = True
+                                child_answer.append(answer)
                                 await emit(_message(ids, answer), paced=True)
                         elif child_event.event == "message_end":
                             metadata = payload.get("metadata") or {}
@@ -250,6 +338,25 @@ async def _produce(
                                 child_usage = metadata["usage"]
                         elif child_event.event == "error":
                             raise RuntimeError(str(payload.get("message") or "上游返回错误"))
+                        elif child_event.event == "workflow_finished":
+                            saw_workflow_finished = True
+                            finished_data = payload.get("data")
+                            child_run_status = (
+                                finished_data.get("status")
+                                if isinstance(finished_data, dict)
+                                else None
+                            )
+                            if child_run_status and child_run_status != "succeeded":
+                                raise RuntimeError(
+                                    f"子工作流结束状态异常: {child_run_status or 'unknown'}"
+                                )
+
+                    if task.cancelled.is_set():
+                        child_status = "cancelled"
+                    elif not saw_workflow_finished:
+                        raise RuntimeError("子工作流流结束时缺少成功的 workflow_finished 事件")
+                    else:
+                        child_status = "succeeded"
 
                     if child_resources is not None:
                         resources.extend(child_resources)
@@ -263,6 +370,7 @@ async def _produce(
                         type(exc).__name__,
                         exc,
                     )
+                    child_status = "cancelled" if task.cancelled.is_set() else "failed"
                     failure = (
                         "\n\n> 本模块回答未完整生成，请稍后重试。"
                         if had_text
@@ -270,21 +378,58 @@ async def _produce(
                     )
                     await emit(_message(ids, failure))
                 finally:
+                    await state.record_child_result(
+                        request_id,
+                        workflow,
+                        status=child_status,
+                        elapsed_seconds=time.monotonic() - child_started,
+                        answer="".join(child_answer),
+                    )
                     await state.set_child_task(ids["task_id"], workflow, None)
 
         status = "stopped" if task.cancelled.is_set() else "succeeded"
+        request_success = await state.request_has_successful_child(request_id)
+        await state.finish_request(
+            request_id,
+            elapsed_seconds=time.monotonic() - started,
+            success=request_success,
+            status=status,
+        )
         await finish(status)
     except asyncio.CancelledError:
         task.cancelled.set()
+        await state.finish_request(
+            request_id,
+            elapsed_seconds=time.monotonic() - started,
+            success=await state.request_has_successful_child(request_id),
+            status="interrupted",
+        )
         raise
     except Exception:
         logger.exception("unhandled_orchestration_error task_id=%s", ids["task_id"])
         await emit(_message(ids, "网关处理请求时发生错误，请稍后重试。"))
+        await state.finish_request(
+            request_id,
+            elapsed_seconds=time.monotonic() - started,
+            success=await state.request_has_successful_child(request_id),
+            status="failed",
+        )
         if not finalized:
             await finish("failed")
     finally:
+        if lock_heartbeat is not None:
+            lock_heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await lock_heartbeat
+        if conversation_lock_acquired:
+            with contextlib.suppress(Exception):
+                await state.release_conversation_lock(
+                    request.user, ids["conversation_id"], request_id
+                )
         async with state.lock:
             state.tasks.pop(ids["task_id"], None)
+        with contextlib.suppress(Exception):
+            await state.unregister_task(ids["task_id"])
         current = asyncio.current_task()
         if current is None or not current.cancelling():
             await queue.put(_END)
@@ -359,13 +504,15 @@ async def stream_response(request: ChatMessageRequest) -> AsyncIterator[bytes]:
 
 
 async def stop_task(public_task_id: str, user: str) -> bool:
+    found, workflow, child_task_id = await state.request_stop(public_task_id, user)
+    if not found:
+        return False
     async with state.lock:
         active = state.tasks.get(public_task_id)
-        if not active or active.user != user:
-            return False
-        active.cancelled.set()
-        workflow = active.current_workflow
-        child_task_id = active.current_child_task_id
+        if active and active.user == user:
+            active.cancelled.set()
+            workflow = active.current_workflow or workflow
+            child_task_id = active.current_child_task_id or child_task_id
 
     if workflow and child_task_id and workflow in WORKFLOW_CONFIGS:
         timeout = httpx.Timeout(10)
