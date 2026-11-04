@@ -42,7 +42,7 @@
 - 多工作流严格串行调用；单个工作流失败不影响后续工作流。
 - 意图识别使用当前 query 和同一用户会话最近三轮已完成的 query/成功子工作流回答。
 - 公共 SSE 自行发送心跳，只发送一组公共 ID 和一个最终 `message_end`。
-- 流式回答默认以 7 个文本单位/秒起步平滑输出；默认自适应模式会在积压时加速，严格模式固定速率。单位采用与模型无关的分词近似，不代表上游模型的精确 token 数。
+- 流式回答默认以 60 个文本单位/秒起步平滑输出；默认自适应模式会在积压时加速。平滑输出最多滞后 2 秒，队列满时立即追赶，以免阻塞上游读取和延迟结束事件。单位采用与模型无关的分词近似，不代表上游模型的精确 token 数。
 
 公共会话到子工作流会话的映射，以及每次请求的路由/回答记录保存在
 `data/gateway_state.sqlite3`；Docker Compose 将 `./data` 挂载到容器，容器重启或重建后可恢复。
@@ -53,8 +53,11 @@ SQLite 事务支持多个 FastAPI worker 并发读写，并按用户和公共会
 
 流式节奏通过 `GATEWAY_CONFIG` 配置：`output_pacing_enabled` 控制开关，
 `output_pacing_mode` 可设为 `adaptive` 或 `strict`，`output_tokens_per_second`
-默认是 7。`output_max_tokens_per_second`、`output_backlog_threshold` 和
-`output_buffer_units` 分别控制自适应上限、积压阈值和有界缓冲。
+默认是 60。`output_max_tokens_per_second`、`output_backlog_threshold` 和
+`output_buffer_units` 分别控制正常平滑输出的自适应上限、积压阈值和有界缓冲。
+`output_max_delay_seconds` 限制内容在输出队列中等待平滑发送的时间；队列接近满时会立即发送，
+因此这些速度配置只影响输出体验，不限制上游流的读取速度。节点执行期间没有正文时，网关仍按
+`heartbeat_interval_seconds` 发送心跳，新节点产生内容后继续输出。
 
 ## 设计文档
 

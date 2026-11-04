@@ -23,6 +23,15 @@ def _database_path() -> Path:
     return Path(__file__).resolve().parent.parent / configured
 
 
+def _seconds_to_milliseconds(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(round(float(value) * 1000))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 @dataclass
 class ActiveTask:
     user: str
@@ -73,7 +82,7 @@ class MemoryState:
                     requested_at TEXT NOT NULL,
                     query TEXT NOT NULL,
                     routes_json TEXT NOT NULL DEFAULT '[]',
-                    elapsed_seconds REAL,
+                    elapsed_ms INTEGER,
                     status TEXT NOT NULL,
                     success INTEGER
                 );
@@ -91,7 +100,7 @@ class MemoryState:
                     workflow TEXT NOT NULL,
                     child_conversation_id TEXT,
                     status TEXT NOT NULL,
-                    elapsed_seconds REAL,
+                    elapsed_ms INTEGER,
                     answer TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(request_id, workflow),
                     FOREIGN KEY(request_id) REFERENCES requests(request_id)
@@ -117,6 +126,19 @@ class MemoryState:
                 );
                 """
             )
+            # Migrate databases created before durations were stored in milliseconds.
+            for table in ("requests", "child_runs"):
+                columns = {
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                if "elapsed_ms" not in columns:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN elapsed_ms INTEGER")
+                if "elapsed_seconds" in columns:
+                    connection.execute(
+                        f"UPDATE {table} SET elapsed_ms=CAST(ROUND(elapsed_seconds * 1000) AS INTEGER) "
+                        "WHERE elapsed_ms IS NULL AND elapsed_seconds IS NOT NULL"
+                    )
         self._import_legacy_json()
 
     def _import_legacy_json(self) -> None:
@@ -166,7 +188,7 @@ class MemoryState:
                     request_status = "interrupted"
                 connection.execute(
                     """INSERT OR IGNORE INTO requests
-                    (request_id,user,public_id,requested_at,query,routes_json,elapsed_seconds,status,success)
+                    (request_id,user,public_id,requested_at,query,routes_json,elapsed_ms,status,success)
                     VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
                         request_id,
@@ -175,7 +197,7 @@ class MemoryState:
                         str(record.get("requested_at") or ""),
                         str(record.get("query") or ""),
                         json.dumps(record.get("routes") or [], ensure_ascii=False),
-                        record.get("elapsed_seconds"),
+                        _seconds_to_milliseconds(record.get("elapsed_seconds")),
                         request_status,
                         int(bool(record.get("success")))
                         if record.get("success") is not None
@@ -190,14 +212,14 @@ class MemoryState:
                         child_status = "interrupted"
                     connection.execute(
                         """INSERT OR IGNORE INTO child_runs
-                        (request_id,workflow,child_conversation_id,status,elapsed_seconds,answer)
+                        (request_id,workflow,child_conversation_id,status,elapsed_ms,answer)
                         VALUES(?,?,?,?,?,?)""",
                         (
                             request_id,
                             str(workflow),
                             child.get("conversation_id"),
                             child_status,
-                            child.get("elapsed_seconds"),
+                            _seconds_to_milliseconds(child.get("elapsed_seconds")),
                             str(child.get("answer") or ""),
                         ),
                     )
@@ -405,7 +427,7 @@ class MemoryState:
         workflow: str,
         *,
         status: str,
-        elapsed_seconds: float,
+        elapsed_ms: int,
         answer: str,
     ) -> None:
         def save(connection: sqlite3.Connection) -> None:
@@ -417,12 +439,12 @@ class MemoryState:
                 return
             connection.execute(
                 """INSERT INTO child_runs
-                (request_id,workflow,status,elapsed_seconds,answer)
+                (request_id,workflow,status,elapsed_ms,answer)
                 VALUES(?,?,?,?,?)
                 ON CONFLICT(request_id,workflow) DO UPDATE SET
-                status=excluded.status,elapsed_seconds=excluded.elapsed_seconds,
+                status=excluded.status,elapsed_ms=excluded.elapsed_ms,
                 answer=excluded.answer""",
-                (request_id, workflow, status, round(elapsed_seconds, 3), answer),
+                (request_id, workflow, status, elapsed_ms, answer),
             )
 
         await asyncio.to_thread(self._transaction, save)
@@ -431,7 +453,7 @@ class MemoryState:
         self,
         request_id: str,
         *,
-        elapsed_seconds: float,
+        elapsed_ms: int,
         success: bool,
         status: str,
     ) -> None:
@@ -442,9 +464,9 @@ class MemoryState:
             if current is None or current["status"] == "interrupted":
                 return
             connection.execute(
-                """UPDATE requests SET elapsed_seconds=?,success=?,status=?
+                """UPDATE requests SET elapsed_ms=?,success=?,status=?
                 WHERE request_id=?""",
-                (round(elapsed_seconds, 3), int(success), status, request_id),
+                (elapsed_ms, int(success), status, request_id),
             )
 
         await asyncio.to_thread(self._transaction, finish)

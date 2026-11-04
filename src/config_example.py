@@ -17,6 +17,9 @@ GATEWAY_CONFIG = {
     "output_max_tokens_per_second": 120,
     "output_backlog_threshold": 35,
     "output_buffer_units": 512,
+    # Maximum time a queued text unit may wait for presentation pacing.
+    # When the queue is full, catch up immediately to keep reading upstream.
+    "output_max_delay_seconds": 2,
 }
 
 # OpenAI Chat Completions 兼容接口，用于意图识别。

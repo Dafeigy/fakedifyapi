@@ -328,6 +328,9 @@ SQLite 文件适用于同一主机上的多个 worker。多个主机或容器若
 - `currency`：全部可计价子调用一致时保留。
 - `latency`：公共请求的实际墙钟耗时，而不是盲目相加子 latency。
 
+`latency`、SSE `workflow_finished.data.elapsed_time` 以及 SQLite 中的请求和子流程耗时均以整数毫秒记录。
+旧 SQLite 数据库中的 `elapsed_seconds` 会在启动时换算到 `elapsed_ms`；旧 JSON 状态导入时也会从秒换算为毫秒。
+
 若不同 Dify 版本的 usage 字段存在差异，聚合器应保留兼容的已知字段，并允许未知字段被忽略。
 
 ## 11. 部分成功策略

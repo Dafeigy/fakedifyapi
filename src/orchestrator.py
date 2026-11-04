@@ -26,6 +26,7 @@ _TOKEN_PATTERN = re.compile(
     re.UNICODE,
 )
 _OUTPUT_QUEUE_MAXSIZE = 512
+_OUTPUT_MAX_DELAY_SECONDS = 2.0
 
 
 def _text_units(text: str) -> Iterator[str]:
@@ -109,14 +110,18 @@ def _collect_usage(total: dict[str, Any], usage: dict[str, Any]) -> None:
     total["total_price"] = str(Decimal(total.get("total_price", "0")) + amount)
 
 
-def _clean_usage(usage: dict[str, Any], elapsed: float) -> dict[str, Any]:
+def _clean_usage(usage: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
     usage.pop("_mixed_currency", None)
-    usage["latency"] = round(elapsed, 3)
+    usage["latency"] = elapsed_ms
     if "total_tokens" not in usage:
         usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get(
             "completion_tokens", 0
         )
     return usage
+
+
+def _elapsed_ms(started: float) -> int:
+    return round((time.monotonic() - started) * 1000)
 
 
 def _clean_resources(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -164,7 +169,7 @@ async def _maintain_conversation_lock(
 async def _produce(
     request: ChatMessageRequest,
     ids: dict[str, str],
-    queue: asyncio.Queue[tuple[bytes, bool] | object],
+    queue: asyncio.Queue[tuple[bytes, bool, float] | object],
     client: httpx.AsyncClient,
 ) -> None:
     started = time.monotonic()
@@ -185,9 +190,9 @@ async def _produce(
             and isinstance(payload.get("answer"), str)
         ):
             for unit in _text_units(payload["answer"]):
-                await queue.put((encode_data(_message(ids, unit)), True))
+                await queue.put((encode_data(_message(ids, unit)), True, time.monotonic()))
             return
-        await queue.put((encode_data(payload), False))
+        await queue.put((encode_data(payload), False, time.monotonic()))
 
     async def finish(status: str) -> None:
         nonlocal finalized
@@ -195,7 +200,7 @@ async def _produce(
             {
                 **_base_event("message_end", ids),
                 "metadata": {
-                    "usage": _clean_usage(usage, time.monotonic() - started),
+                    "usage": _clean_usage(usage, _elapsed_ms(started)),
                     "retriever_resources": _clean_resources(resources),
                 },
             }
@@ -207,7 +212,7 @@ async def _produce(
                 "data": {
                     "id": ids["workflow_run_id"],
                     "status": status,
-                    "elapsed_time": round(time.monotonic() - started, 3),
+                    "elapsed_time": _elapsed_ms(started),
                 },
             }
         )
@@ -382,7 +387,7 @@ async def _produce(
                         request_id,
                         workflow,
                         status=child_status,
-                        elapsed_seconds=time.monotonic() - child_started,
+                        elapsed_ms=_elapsed_ms(child_started),
                         answer="".join(child_answer),
                     )
                     await state.set_child_task(ids["task_id"], workflow, None)
@@ -391,7 +396,7 @@ async def _produce(
         request_success = await state.request_has_successful_child(request_id)
         await state.finish_request(
             request_id,
-            elapsed_seconds=time.monotonic() - started,
+            elapsed_ms=_elapsed_ms(started),
             success=request_success,
             status=status,
         )
@@ -400,7 +405,7 @@ async def _produce(
         task.cancelled.set()
         await state.finish_request(
             request_id,
-            elapsed_seconds=time.monotonic() - started,
+            elapsed_ms=_elapsed_ms(started),
             success=await state.request_has_successful_child(request_id),
             status="interrupted",
         )
@@ -410,7 +415,7 @@ async def _produce(
         await emit(_message(ids, "网关处理请求时发生错误，请稍后重试。"))
         await state.finish_request(
             request_id,
-            elapsed_seconds=time.monotonic() - started,
+            elapsed_ms=_elapsed_ms(started),
             success=await state.request_has_successful_child(request_id),
             status="failed",
         )
@@ -437,7 +442,7 @@ async def _produce(
 
 async def stream_response(request: ChatMessageRequest) -> AsyncIterator[bytes]:
     ids = _public_ids(request.conversation_id)
-    queue: asyncio.Queue[tuple[bytes, bool] | object] = asyncio.Queue(
+    queue: asyncio.Queue[tuple[bytes, bool, float] | object] = asyncio.Queue(
         maxsize=max(1, int(GATEWAY_CONFIG.get("output_buffer_units", _OUTPUT_QUEUE_MAXSIZE)))
     )
     timeout = httpx.Timeout(
@@ -458,6 +463,10 @@ async def stream_response(request: ChatMessageRequest) -> AsyncIterator[bytes]:
             base_rate = max(0.1, float(GATEWAY_CONFIG.get("output_tokens_per_second", 7)))
             max_rate = max(base_rate, float(GATEWAY_CONFIG.get("output_max_tokens_per_second", 28)))
             backlog_threshold = max(1, int(GATEWAY_CONFIG.get("output_backlog_threshold", 35)))
+            max_delay = max(
+                0.0,
+                float(GATEWAY_CONFIG.get("output_max_delay_seconds", _OUTPUT_MAX_DELAY_SECONDS)),
+            )
             next_token_at = time.monotonic()
             started = next_token_at
             sent_units = 0
@@ -470,23 +479,36 @@ async def stream_response(request: ChatMessageRequest) -> AsyncIterator[bytes]:
                     continue
                 if item is _END:
                     break
-                frame, paced = item
+                frame, paced, enqueued_at = item
                 if paced and pacing_enabled:
                     backlog = queue.qsize()
                     max_backlog = max(max_backlog, backlog)
                     rate = base_rate
                     if pacing_mode == "adaptive" and backlog > backlog_threshold:
                         rate = min(max_rate, base_rate * (1 + backlog / backlog_threshold))
-                    delay = next_token_at - time.monotonic()
+                    # Do not let presentation pacing block upstream reads or make
+                    # terminal events wait behind an old burst of text.
+                    deadline = enqueued_at + max_delay
+                    now = time.monotonic()
+                    delay = (
+                        0.0 if backlog >= queue.maxsize - 1
+                        else max(0.0, min(next_token_at, deadline) - now)
+                    )
                     while delay > 0:
                         if delay >= heartbeat:
                             await asyncio.sleep(heartbeat)
                             yield encode_ping()
                         else:
                             await asyncio.sleep(delay)
-                        delay = next_token_at - time.monotonic()
+                        now = time.monotonic()
+                        delay = (
+                            0.0 if queue.qsize() >= queue.maxsize - 1
+                            else max(0.0, min(next_token_at, deadline) - now)
+                        )
                     now = time.monotonic()
-                    next_token_at = max(next_token_at, now) + 1 / rate
+                    next_token_at = (
+                        now if now - enqueued_at >= max_delay else max(next_token_at, now)
+                    ) + 1 / rate
                     sent_units += 1
                 yield frame
             if sent_units:

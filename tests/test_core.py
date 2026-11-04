@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from typing import Any
 
 import httpx
@@ -177,3 +179,51 @@ async def test_workflows_stream_serially_and_merge_resources(monkeypatch: Any) -
         item["position"] for item in end["metadata"]["retriever_resources"]
     ] == [1, 2]
     assert end["metadata"]["usage"]["total_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_pacing_catches_up_across_node_gap_and_preserves_end(monkeypatch: Any) -> None:
+    from src import orchestrator
+
+    for key, value in {
+        "output_pacing_enabled": True,
+        "output_pacing_mode": "adaptive",
+        "output_tokens_per_second": 1,
+        "output_max_tokens_per_second": 1,
+        "output_buffer_units": 4,
+        "output_max_delay_seconds": 0.05,
+        "heartbeat_interval_seconds": 0.01,
+    }.items():
+        monkeypatch.setitem(orchestrator.GATEWAY_CONFIG, key, value)
+
+    async def classify(*args: Any, **kwargs: Any) -> list[str]:
+        return ["子工作流A"]
+
+    async def child_stream(*args: Any, **kwargs: Any):
+        for answer in ("甲" * 20, "乙" * 20):
+            yield ChildEvent(event="message", payload={"event": "message", "answer": answer})
+            await asyncio.sleep(0.08)
+        yield ChildEvent(event="message_end", payload={"event": "message_end"})
+        yield ChildEvent(event="workflow_finished", payload={"event": "workflow_finished"})
+
+    monkeypatch.setattr(OpenAICompatibleClient, "classify", classify)
+    monkeypatch.setattr(DifyClient, "stream_chatflow", child_stream)
+    request = ChatMessageRequest(
+        inputs={}, query="test", response_mode="streaming", user="tester"
+    )
+    started = time.monotonic()
+    raw = b"".join([chunk async for chunk in stream_response(request)]).decode()
+    elapsed = time.monotonic() - started
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert "".join(item["answer"] for item in payloads if item["event"] == "message") == (
+        "### 子工作流A\n\n" + "甲" * 20 + "乙" * 20
+    )
+    assert [item["event"] for item in payloads[-2:]] == [
+        "message_end", "workflow_finished"
+    ]
+    assert raw.count("event: ping") >= 2
+    assert elapsed < 5
